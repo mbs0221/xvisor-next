@@ -1,5 +1,5 @@
 #/**
-# Copyright (C) 2014 Institut de Recherche Technologique SystemX and OpenWide.
+# Copyright (c) 2018 Anup Patel.
 # All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
@@ -17,13 +17,8 @@
 # Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 #
 # @file objects.mk
-# @author Jimmy Durand Wesolowski (jimmy.durand-wesolowski@openwide.fr)
-# @brief list of SPI driver objects
+# @author Anup Patel (anup@brainfault.org)
+# @brief list of Broadcom DTBs.
 # */
 
-drivers-objs-$(CONFIG_SPI_MASTER)+= spi/spi.o
-drivers-objs-$(CONFIG_SPI_BITBANG)+= spi/spi-bitbang.o
-drivers-objs-$(CONFIG_SPI_IMX)+= spi/spi-imx.o
-drivers-objs-$(CONFIG_SPI_BCM2835)+=spi/spi-bcm2835.o
-drivers-objs-$(CONFIG_SPI_SIFIVE)+=spi/spi-sifive.o
-drivers-objs-$(CONFIG_SPI_SPIDEV)+= spi/spidev.o
+arch-dtbs-$(CONFIG_RISCV)+=rocketchip/rocketchip-vc709.dtb

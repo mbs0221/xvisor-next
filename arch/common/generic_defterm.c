@@ -628,6 +628,68 @@ static struct defterm_ops zynq_uart_ops = {
 
 #endif
 
+#if defined(CONFIG_SERIAL_SIFIVE)
+
+#include <drv/serial/sifive-uart.h>
+
+struct sifive_uart_port uart_port;
+
+static int sifive_uart_defterm_getc(u8 *ch)
+{
+	if (!sifive_uart_lowlevel_can_getc(uart_port.regs)) {
+		return VMM_EFAIL;
+	}
+	*ch = sifive_uart_lowlevel_getc(uart_port.regs);
+	return VMM_OK;
+}
+
+static int sifive_uart_defterm_putc(u8 ch)
+{
+	if (!sifive_uart_lowlevel_can_putc(uart_port.regs)) {
+		return VMM_EFAIL;
+	}
+
+	sifive_uart_lowlevel_putc(uart_port.regs, ch);
+	return VMM_OK;
+}
+
+static int __init sifive_uart_defterm_init(struct vmm_devtree_node *node)
+{
+	int rc;
+
+	rc = vmm_devtree_regmap(node, (virtual_addr_t*)&uart_port.regs, 0);
+	if (rc) {
+		return rc;
+	}
+	rc = vmm_devtree_clock_frequency(node,
+				&uart_port.input_clock);
+	if (rc) {
+		uart_port.skip_baudrate_config = TRUE;
+	} else {
+		uart_port.skip_baudrate_config = FALSE;
+	}
+
+	if (vmm_devtree_read_u32(node, "baudrate",
+					&uart_port.baudrate)) {
+		uart_port.baudrate = SIFIVE_DEFAULT_BAUD_RATE;
+	}
+
+	sifive_uart_lowlevel_init(&uart_port);
+
+	return VMM_OK;
+}
+
+static struct defterm_ops sifive_uart_ops = {
+	.putc = sifive_uart_defterm_putc,
+	.getc = sifive_uart_defterm_getc,
+	.init = sifive_uart_defterm_init
+};
+#else
+
+#define sifive_uart_ops unknown_ops
+
+#endif
+
 static struct vmm_devtree_nodeid defterm_devid_table[] = {
 	{ .compatible = "arm,pl011", .data = &pl011_ops },
 	{ .compatible = "ns8250", .data = &uart8250_ops },
@@ -649,6 +711,7 @@ static struct vmm_devtree_nodeid defterm_devid_table[] = {
 	{ .compatible = "brcm,bcm283x-mu", .data = &bcm283x_mu_ops },
 	{ .compatible = "cdns,uart-r1p12", .data = &zynq_uart_ops },
 	{ .compatible = "xlnx,xuartps", .data = &zynq_uart_ops },
+	{ .compatible = "sifive,uart0", .data = &sifive_uart_ops },
 	{ /* end of list */ },
 };
 
