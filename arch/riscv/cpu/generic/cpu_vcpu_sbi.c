@@ -35,6 +35,7 @@ extern const struct cpu_vcpu_sbi_extension vcpu_sbi_base;
 extern const struct cpu_vcpu_sbi_extension vcpu_sbi_hsm;
 extern const struct cpu_vcpu_sbi_extension vcpu_sbi_srst;
 extern const struct cpu_vcpu_sbi_extension vcpu_sbi_legacy;
+extern const struct cpu_vcpu_sbi_extension vcpu_sbi_xvisor;
 
 static const struct cpu_vcpu_sbi_extension *vcpu_sbi[] = {
 	&vcpu_sbi_time,
@@ -44,6 +45,7 @@ static const struct cpu_vcpu_sbi_extension *vcpu_sbi[] = {
 	&vcpu_sbi_hsm,
 	&vcpu_sbi_srst,
 	&vcpu_sbi_legacy,
+	&vcpu_sbi_xvisor,
 };
 
 const struct cpu_vcpu_sbi_extension *cpu_vcpu_sbi_find_extension(
@@ -71,6 +73,17 @@ int cpu_vcpu_sbi_ecall(struct vmm_vcpu *vcpu, ulong cause,
 	unsigned long out_val = 0;
 	bool is_0_1_spec = FALSE;
 	unsigned long args[6];
+
+	/* Forward SBI calls from virtual-VS mode to virtual-HS mode */
+	if (riscv_nested_virt(vcpu)) {
+		trap.sepc = regs->sepc;
+		trap.scause = CAUSE_VIRTUAL_SUPERVISOR_ECALL;
+		trap.stval = 0;
+		trap.htval = 0;
+		trap.htinst = 0;
+		cpu_vcpu_redirect_trap(vcpu, regs, &trap);
+		return VMM_OK;
+	}
 
 	args[0] = regs->a0;
 	args[1] = regs->a1;

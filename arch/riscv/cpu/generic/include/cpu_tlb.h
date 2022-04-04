@@ -27,13 +27,13 @@
 #include <vmm_types.h>
 
 /** Invalidate Stage2 TLBs for given VMID and guest physical address */
-void __hfence_gvma_vmid_gpa(unsigned long gpa, unsigned long vmid);
+void __hfence_gvma_vmid_gpa(unsigned long gpa_divby_4, unsigned long vmid);
 
 /** Invalidate Stage2 TLBs for given VMID */
 void __hfence_gvma_vmid(unsigned long vmid);
 
 /** Invalidate Stage2 TLBs for given guest physical address */
-void __hfence_gvma_gpa(unsigned long gpa);
+void __hfence_gvma_gpa(unsigned long gpa_divby_4);
 
 /** Invalidate all possible Stage2 TLBs */
 void __hfence_gvma_all(void);
@@ -52,7 +52,7 @@ void __hfence_vvma_all(void);
 
 inline void __sfence_vma_asid_va(unsigned long asid, unsigned long va)
 {
-	__asm__ __volatile__("sfence.vma %0 %1"
+	__asm__ __volatile__("sfence.vma %0, %1"
 			      :
 			      : "r"(va),"r"(asid)
 			      : "memory");
@@ -60,7 +60,7 @@ inline void __sfence_vma_asid_va(unsigned long asid, unsigned long va)
 
 inline void __sfence_vma_asid(unsigned long asid)
 {
-	__asm__ __volatile__("sfence.vma x0 %1"
+	__asm__ __volatile__("sfence.vma x0, %1"
 			     :
 			     : "r"(asid)
 			     : "memory");

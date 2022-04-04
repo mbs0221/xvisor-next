@@ -39,6 +39,8 @@
 #include <cpu_tlb.h>
 #include <cpu_sbi.h>
 #include <cpu_vcpu_fp.h>
+#include <cpu_vcpu_trap.h>
+#include <cpu_vcpu_nested.h>
 #include <cpu_vcpu_helper.h>
 #include <cpu_vcpu_timer.h>
 #include <cpu_guest_serial.h>
@@ -52,8 +54,7 @@
 				 riscv_isa_extension_mask(f) | \
 				 riscv_isa_extension_mask(i) | \
 				 riscv_isa_extension_mask(m) | \
-				 riscv_isa_extension_mask(s) | \
-				 riscv_isa_extension_mask(u))
+				 riscv_isa_extension_mask(h))
 
 static char *guest_fdt_find_serial_node(char *guest_name)
 {
@@ -101,6 +102,7 @@ int arch_guest_init(struct vmm_guest *guest)
 {
 	struct riscv_guest_priv *priv;
 	struct riscv_guest_serial *gserial;
+	u32 pgtbl_attr, pgtbl_hw_tag;
 	char *sname;
 	int rc;
 
@@ -117,15 +119,27 @@ int arch_guest_init(struct vmm_guest *guest)
 
 		priv->time_delta = -get_cycles64();
 
-		priv->pgtbl = mmu_pgtbl_alloc(MMU_STAGE2, -1);
+		pgtbl_hw_tag = 0;
+		pgtbl_attr = MMU_ATTR_REMOTE_TLB_FLUSH;
+		if (riscv_stage2_vmid_available()) {
+			pgtbl_hw_tag = guest->id;
+			pgtbl_attr |= MMU_ATTR_HW_TAG_VALID;
+		}
+		priv->pgtbl = mmu_pgtbl_alloc(MMU_STAGE2, -1,
+					      pgtbl_attr, pgtbl_hw_tag);
 		if (!priv->pgtbl) {
 			vmm_free(guest->arch_priv);
 			guest->arch_priv = NULL;
 			return VMM_ENOMEM;
 		}
+
 		priv->guest_serial = vmm_malloc(sizeof(struct riscv_guest_serial));
-		if (!priv->guest_serial)
+		if (!priv->guest_serial) {
+			mmu_pgtbl_free(riscv_guest_priv(guest)->pgtbl);
+			vmm_free(guest->arch_priv);
+			guest->arch_priv = NULL;
 			return VMM_ENOMEM;
+		}
 
 		gserial = riscv_guest_serial(guest);
 		sname = guest_fdt_find_serial_node(guest->name);
@@ -138,8 +152,13 @@ int arch_guest_init(struct vmm_guest *guest)
 		gserial->vser_client.notifier_call = &guest_vserial_notification;
 		gserial->vser_client.priority = 0;
 		rc = vmm_vserial_register_client(&gserial->vser_client);
-		if (rc)
+		if (rc) {
+			vmm_free(gserial);
+			mmu_pgtbl_free(riscv_guest_priv(guest)->pgtbl);
+			vmm_free(guest->arch_priv);
+			guest->arch_priv = NULL;
 			return rc;
+		}
 	}
 
 	return VMM_OK;
@@ -224,18 +243,18 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 		rc = vmm_devtree_read_string(vcpu->node,
 				VMM_DEVTREE_COMPATIBLE_ATTR_NAME, &attr);
 		if (rc) {
-			goto done;
+			goto fail;
 		}
 		if (strcmp(attr, "riscv,generic") != 0) {
 			rc = VMM_EINVALID;
-			goto done;
+			goto fail;
 		}
 
 		/* Alloc private context */
 		vcpu->arch_priv = vmm_zalloc(sizeof(struct riscv_priv));
 		if (!vcpu->arch_priv) {
 			rc = VMM_ENOMEM;
-			goto done;
+			goto fail;
 		}
 
 		/* Set register width */
@@ -245,10 +264,8 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 		riscv_priv(vcpu)->isa =
 			vmm_zalloc(bitmap_estimate_size(RISCV_ISA_EXT_MAX));
 		if (!riscv_priv(vcpu)->isa) {
-			vmm_free(vcpu->arch_priv);
-			vcpu->arch_priv = NULL;
 			rc = VMM_ENOMEM;
-			goto done;
+			goto fail_free_priv;
 		}
 
 		/* Parse VCPU ISA string */
@@ -256,19 +273,31 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 		rc = vmm_devtree_read_string(vcpu->node, "riscv,isa", &attr);
 		if (rc || !attr) {
 			rc = VMM_EINVALID;
-			goto done;
+			goto fail_free_isa;
 		}
 		rc = riscv_isa_parse_string(attr, &riscv_priv(vcpu)->xlen,
 					    riscv_priv(vcpu)->isa,
 					    RISCV_ISA_EXT_MAX);
 		if (rc) {
-			goto done;
+			goto fail_free_isa;
 		}
 		if (riscv_priv(vcpu)->xlen > riscv_xlen) {
 			rc = VMM_EINVALID;
-			goto done;
+			goto fail_free_isa;
 		}
 		riscv_priv(vcpu)->isa[0] &= RISCV_ISA_ALLOWED;
+
+		/* H-extension only available when AIA CSRs are available */
+		if (!riscv_aia_available) {
+			riscv_priv(vcpu)->isa[0] &=
+					~riscv_isa_extension_mask(h);
+		}
+
+		/* Initialize nested state */
+		rc = cpu_vcpu_nested_init(vcpu);
+		if (rc) {
+			goto fail_free_isa;
+		}
 	}
 
 	/* Set a0 to VCPU sub-id (i.e. virtual HARTID) */
@@ -295,11 +324,26 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 	riscv_priv(vcpu)->vstval = 0;
 	riscv_priv(vcpu)->vsatp = 0;
 
+	/* By default, make CY, TM, and IR counters accessible in VU mode */
+	riscv_priv(vcpu)->scounteren = 7;
+
+	/* Reset nested state */
+	cpu_vcpu_nested_reset(vcpu);
+
 	/* Initialize FP state */
 	cpu_vcpu_fp_init(vcpu);
 
 	riscv_timer_event_init(vcpu, &riscv_timer_priv(vcpu));
-done:
+
+	return VMM_OK;
+
+fail_free_isa:
+	vmm_free(riscv_priv(vcpu)->isa);
+	riscv_priv(vcpu)->isa = NULL;
+fail_free_priv:
+	vmm_free(vcpu->arch_priv);
+	vcpu->arch_priv = NULL;
+fail:
 	return rc;
 }
 
@@ -325,9 +369,13 @@ int arch_vcpu_deinit(struct vmm_vcpu *vcpu)
 		return VMM_OK;
 	}
 
+	/* Cleanup timer */
 	rc = riscv_timer_event_deinit(vcpu, &riscv_timer_priv(vcpu));
 	if (rc)
 		return rc;
+
+	/* Cleanup nested state */
+	cpu_vcpu_nested_deinit(vcpu);
 
 	/* Free ISA bitmap */
 	vmm_free(riscv_priv(vcpu)->isa);
@@ -369,15 +417,6 @@ void arch_vcpu_switch(struct vmm_vcpu *tvcpu,
 	memcpy(regs, riscv_regs(vcpu), sizeof(*regs));
 	if (vcpu->is_normal) {
 		priv = riscv_priv(vcpu);
-#ifdef CONFIG_64BIT
-		csr_write(CSR_HTIMEDELTA,
-			riscv_guest_priv(vcpu->guest)->time_delta);
-#else
-		csr_write(CSR_HTIMEDELTA,
-			(u32)(riscv_guest_priv(vcpu->guest)->time_delta));
-		csr_write(CSR_HTIMEDELTAH,
-			(u32)(riscv_guest_priv(vcpu->guest)->time_delta >> 32));
-#endif
 		csr_write(CSR_HIE, priv->hie);
 		csr_write(CSR_HVIP, priv->hvip);
 		csr_write(CSR_VSSTATUS, priv->vsstatus);
@@ -389,14 +428,10 @@ void arch_vcpu_switch(struct vmm_vcpu *tvcpu,
 		csr_write(CSR_VSATP, priv->vsatp);
 		csr_write(CSR_SCOUNTEREN, priv->scounteren);
 		cpu_vcpu_fp_restore(vcpu, regs);
-		if (CONFIG_MAX_GUEST_COUNT <= (1UL << riscv_stage2_vmid_bits)) {
-			mmu_stage2_change_pgtbl(vcpu->guest->id,
-					riscv_guest_priv(vcpu->guest)->pgtbl);
-		} else {
-			mmu_stage2_change_pgtbl(0,
-					riscv_guest_priv(vcpu->guest)->pgtbl);
-			__hfence_gvma_all();
-		}
+		cpu_vcpu_time_delta_update(vcpu, riscv_nested_virt(vcpu));
+		cpu_vcpu_gstage_update(vcpu, riscv_nested_virt(vcpu));
+		cpu_vcpu_irq_deleg_update(vcpu, riscv_nested_virt(vcpu));
+		cpu_vcpu_take_vsirq(vcpu, regs);
 	}
 }
 
@@ -406,44 +441,107 @@ void arch_vcpu_post_switch(struct vmm_vcpu *vcpu,
 	/* Nothing to do here */
 }
 
+void cpu_vcpu_irq_deleg_update(struct vmm_vcpu *vcpu, bool nested_virt)
+{
+	if (nested_virt) {
+		/* Disable interrupt delegation */
+		csr_write(CSR_HIDELEG, 0);
+
+		/* Enable sip/siph and sie/sieh trapping */
+		if (riscv_aia_available) {
+			csr_set(CSR_HVICTL, HVICTL_VTI);
+		}
+	} else {
+		/* Enable interrupt delegation */
+		csr_write(CSR_HIDELEG, HIDELEG_DEFAULT);
+
+		/* Disable sip/siph and sie/sieh trapping */
+		if (riscv_aia_available) {
+			csr_clear(CSR_HVICTL, HVICTL_VTI);
+		}
+	}
+}
+
+void cpu_vcpu_time_delta_update(struct vmm_vcpu *vcpu, bool nested_virt)
+{
+	u64 vtdelta, tdelta = riscv_guest_priv(vcpu->guest)->time_delta;
+
+	if (nested_virt) {
+		vtdelta = riscv_nested_priv(vcpu)->htimedelta;
+#ifndef CONFIG_64BIT
+		vtdelta |= ((u64)riscv_nested_priv(vcpu)->htimedeltah) << 32;
+#endif
+		tdelta += vtdelta;
+	}
+
+#ifdef CONFIG_64BIT
+	csr_write(CSR_HTIMEDELTA, tdelta);
+#else
+	csr_write(CSR_HTIMEDELTA, (u32)tdelta);
+	csr_write(CSR_HTIMEDELTAH, (u32)(tdelta >> 32));
+#endif
+}
+
+void cpu_vcpu_gstage_update(struct vmm_vcpu *vcpu, bool nested_virt)
+{
+	struct mmu_pgtbl *pgtbl = (nested_virt) ?
+				  riscv_nested_priv(vcpu)->pgtbl :
+				  riscv_guest_priv(vcpu->guest)->pgtbl;
+
+	mmu_stage2_change_pgtbl(pgtbl);
+	if (!mmu_pgtbl_has_hw_tag(pgtbl)) {
+		/*
+		 * Invalidate entries related to all guests from both
+		 * G-stage TLB and VS-stage TLB.
+		 *
+		 * NOTE: Due to absence of VMID, there is not VMID tagging
+		 * in VS-stage TLB as well so to avoid one Guest seeing
+		 * VS-stage mappings of other Guest we have to invalidate
+		 * VS-stage TLB enteries as well.
+		 */
+		__hfence_gvma_all();
+		__hfence_vvma_all();
+	}
+}
+
 void cpu_vcpu_dump_general_regs(struct vmm_chardev *cdev,
 				arch_regs_t *regs)
 {
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "       zero", regs->zero, "         ra", regs->ra);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         sp", regs->sp, "         gp", regs->gp);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         tp", regs->tp, "         s0", regs->s0);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         s1", regs->s1, "         a0", regs->a0);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         a1", regs->a1, "         a2", regs->a2);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         a3", regs->a3, "         a4", regs->a4);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         a5", regs->a5, "         a6", regs->a6);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         a7", regs->a7, "         s2", regs->s2);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         s3", regs->s3, "         s4", regs->s4);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         s5", regs->s5, "         s6", regs->s6);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         s7", regs->s7, "         s8", regs->s8);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         s9", regs->s9, "        s10", regs->s10);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "        s11", regs->s11, "         t0", regs->t0);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         t1", regs->t1, "         t2", regs->t2);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         t3", regs->t3, "         t4", regs->t4);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "         t5", regs->t5, "         t6", regs->t6);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "       sepc", regs->sepc, "    sstatus", regs->sstatus);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "    hstatus", regs->hstatus, "    sp_exec", regs->sp_exec);
 }
 
@@ -463,29 +561,31 @@ void cpu_vcpu_dump_private_regs(struct vmm_chardev *cdev,
 	}
 
 	vmm_cprintf(cdev, "\n");
-	vmm_cprintf(cdev, " %s=%s\n",
+	vmm_cprintf(cdev, "    %s=%s\n",
 		    "        isa", isa);
 	vmm_cprintf(cdev, "\n");
 #ifdef CONFIG_64BIT
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR"\n",
 		    " htimedelta", (ulong)gpriv->time_delta);
 #else
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    " htimedelta", (ulong)(gpriv->time_delta),
 		    "htimedeltah", (ulong)(gpriv->time_delta >> 32));
 #endif
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "        hie", priv->hie, "        hip", priv->hip);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "       hvip", priv->hvip, "   vsstatus", priv->vsstatus);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "      vsatp", priv->vsatp, "     vstvec", priv->vstvec);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "  vsscratch", priv->vsscratch, "      vsepc", priv->vsepc);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "    vscause", priv->vscause, "     vstval", priv->vstval);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR"\n",
 		    " scounteren", priv->scounteren);
+
+	cpu_vcpu_nested_dump_regs(cdev, vcpu);
 
 	cpu_vcpu_fp_dump_regs(cdev, vcpu);
 }
@@ -494,9 +594,9 @@ void cpu_vcpu_dump_exception_regs(struct vmm_chardev *cdev,
 				  unsigned long scause, unsigned long stval,
 				  unsigned long htval, unsigned long htinst)
 {
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "     scause", scause, "      stval", stval);
-	vmm_cprintf(cdev, "%s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
+	vmm_cprintf(cdev, "    %s=0x%"PRIADDR" %s=0x%"PRIADDR"\n",
 		    "      htval", htval, "     htinst", htinst);
 }
 

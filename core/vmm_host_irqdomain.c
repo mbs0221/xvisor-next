@@ -143,8 +143,6 @@ struct vmm_host_irqdomain *vmm_host_irqdomain_get(unsigned int hirq)
 
 	vmm_read_unlock_irqrestore_lite(&idctrl.lock, flags);
 
-	vmm_printf("%s: Failed to find host IRQ %d domain\n", __func__, hirq);
-
 	return NULL;
 }
 
@@ -359,6 +357,20 @@ int vmm_host_irqdomain_xlate_onecell(struct vmm_host_irqdomain *domain,
 	return VMM_OK;
 }
 
+int vmm_host_irqdomain_xlate_twocells(struct vmm_host_irqdomain *domain,
+			struct vmm_devtree_node *node,
+			const u32 *intspec, unsigned int intsize,
+			unsigned long *out_hwirq, unsigned int *out_type)
+{
+	if (WARN_ON(intsize != 2))
+		return VMM_EINVALID;
+
+	*out_hwirq = intspec[0];
+	*out_type = intspec[1] & VMM_IRQ_TYPE_SENSE_MASK;
+
+	return VMM_OK;
+}
+
 struct vmm_host_irqdomain *vmm_host_irqdomain_add(
 				struct vmm_devtree_node *of_node,
 				int base, unsigned int size,
@@ -376,6 +388,11 @@ struct vmm_host_irqdomain *vmm_host_irqdomain_add(
 	if ((base >= 0) &&
 	    ((CONFIG_HOST_IRQ_COUNT <= base) ||
 	     (CONFIG_HOST_IRQ_COUNT <= (base + size)))) {
+		return NULL;
+	}
+	if ((base >= 0) &&
+	    (vmm_host_irqdomain_get(base) ||
+	     vmm_host_irqdomain_get(base + size - 1))) {
 		return NULL;
 	}
 

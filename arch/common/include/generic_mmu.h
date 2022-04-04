@@ -44,12 +44,18 @@ enum mmu_stage {
 	MMU_STAGE_MAX
 };
 
+/** MMU page table attributes */
+#define MMU_ATTR_REMOTE_TLB_FLUSH	(1 << 0)
+#define MMU_ATTR_HW_TAG_VALID		(1 << 1)
+
 /** MMU page table */
 struct mmu_pgtbl {
 	struct dlist head;
 	struct mmu_pgtbl *parent;
 	enum mmu_stage stage;
 	int level;
+	u32 attr;
+	u32 hw_tag;
 	physical_addr_t map_ia;
 	physical_addr_t tbl_pa;
 	vmm_spinlock_t tbl_lock; /*< Lock to protect table contents, 
@@ -74,7 +80,7 @@ u64 mmu_pgtbl_count(int stage, int level);
 
 struct mmu_pgtbl *mmu_pgtbl_find(int stage, physical_addr_t tbl_pa);
 
-struct mmu_pgtbl *mmu_pgtbl_alloc(int stage, int level);
+struct mmu_pgtbl *mmu_pgtbl_alloc(int stage, int level, u32 attr, u32 hw_tag);
 
 int mmu_pgtbl_free(struct mmu_pgtbl *pgtbl);
 
@@ -86,6 +92,23 @@ static inline enum mmu_stage mmu_pgtbl_stage(struct mmu_pgtbl *pgtbl)
 static inline int mmu_pgtbl_level(struct mmu_pgtbl *pgtbl)
 {
 	return (pgtbl) ? pgtbl->level : -1;
+}
+
+static inline bool mmu_pgtbl_need_remote_tlbflush(struct mmu_pgtbl *pgtbl)
+{
+	return (pgtbl && (pgtbl->attr & MMU_ATTR_REMOTE_TLB_FLUSH)) ?
+		TRUE : FALSE;
+}
+
+static inline bool mmu_pgtbl_has_hw_tag(struct mmu_pgtbl *pgtbl)
+{
+	return (pgtbl && (pgtbl->attr & MMU_ATTR_HW_TAG_VALID)) ?
+		TRUE : FALSE;
+}
+
+static inline u32 mmu_pgtbl_hw_tag(struct mmu_pgtbl *pgtbl)
+{
+	return (pgtbl) ? pgtbl->hw_tag : 0;
 }
 
 static inline physical_addr_t mmu_pgtbl_map_addr(struct mmu_pgtbl *pgtbl)
@@ -127,6 +150,24 @@ int mmu_map_page(struct mmu_pgtbl *pgtbl, struct mmu_page *pg);
 
 int mmu_find_pte(struct mmu_pgtbl *pgtbl, physical_addr_t ia,
 		     arch_pte_t **ptep, struct mmu_pgtbl **pgtblp);
+
+struct mmu_get_guest_page_ops {
+	void (*setfault)(void *opaque, int stage, int level,
+			 physical_addr_t guest_ia);
+	int (*gpa2hpa)(void *opaque, int stage, int level,
+		       physical_addr_t guest_pa,
+		       physical_addr_t *out_host_pa);
+};
+
+/**
+ * Get guest page table entry
+ *
+ * Returns VMM_OK on success, VMM_EFAULT on trap and VMM_Exxx on failure.
+ */
+int mmu_get_guest_page(physical_addr_t pgtbl_guest_ia, int stage, int level,
+		       const struct mmu_get_guest_page_ops *ops,
+		       void *opaque, physical_addr_t guest_ia,
+		       struct mmu_page *pg);
 
 void mmu_walk_address(struct mmu_pgtbl *pgtbl, physical_addr_t ia,
 		      void (*fn)(struct mmu_pgtbl *, arch_pte_t *, void *),
@@ -180,9 +221,11 @@ static inline u32 mmu_stage2_current_vmid(void)
 	return arch_mmu_stage2_current_vmid();
 }
 
-static inline int mmu_stage2_change_pgtbl(u32 vmid, struct mmu_pgtbl *pgtbl)
+static inline int mmu_stage2_change_pgtbl(struct mmu_pgtbl *pgtbl)
 {
-	return arch_mmu_stage2_change_pgtbl(vmid, pgtbl->tbl_pa);
+	return arch_mmu_stage2_change_pgtbl(mmu_pgtbl_has_hw_tag(pgtbl),
+					    mmu_pgtbl_hw_tag(pgtbl),
+					    pgtbl->tbl_pa);
 }
 
 #endif

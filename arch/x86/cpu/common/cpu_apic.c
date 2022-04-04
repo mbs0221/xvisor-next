@@ -31,6 +31,7 @@
 #include <libs/stringlib.h>
 #include <arch_cpu.h>
 #include <arch_io.h>
+#include <arch_barrier.h>
 #include <cpu_mmu.h>
 #include <cpu_features.h>
 #include <cpu_interrupts.h>
@@ -45,6 +46,8 @@
 #include <tsc.h>
 #include <timers/timer.h>
 
+#define ENABLE_TIMER_TRACE 1
+
 #undef DEBUG_IOAPIC
 
 #ifdef DEBUG_IOAPIC
@@ -52,6 +55,78 @@
 #else
 #define debug_print(fmnt, args...) { }
 #endif
+
+#if ENABLE_TIMER_TRACE
+#define MAX_TRACE_ELEMENTS	2048
+
+typedef struct timer_irq_trace_element {
+	u64 tsc_val;
+	u64 init_val;
+	u64 cc_val;
+	u64 res;
+} timer_irq_te_t;
+
+typedef struct timer_trace_element {
+	u64 timer_val;
+	u64 tsc_val;
+	u64 cc_val;
+	u64 esr_val;
+	u64 lvt_val;
+} timer_te_t;
+
+typedef struct timer_trace {
+	u32 trace_index;
+	u32 trace_irq_index;
+	u32 wraps;
+	u32 irq_wraps;
+	u32 irqs;
+	timer_te_t trace_buf[MAX_TRACE_ELEMENTS];
+	timer_irq_te_t trace_irq_buf[MAX_TRACE_ELEMENTS];
+} timer_trace_t;
+
+static timer_trace_t timer_trace;
+
+void init_trace_timer(void)
+{
+	memset(&timer_trace, 0, sizeof(timer_trace));
+}
+
+void trace_timer(u64 next, u64 tsc, u64 cc, u64 esr, u64 lvt)
+{
+	timer_te_t *te = &timer_trace.trace_buf[timer_trace.trace_index];
+
+	te->timer_val = next;
+	te->tsc_val = tsc;
+	te->cc_val = cc;
+	te->esr_val = esr;
+	te->lvt_val = lvt;
+
+	timer_trace.trace_index++;
+	timer_trace.trace_index %= MAX_TRACE_ELEMENTS;
+	if (timer_trace.trace_index == 0)
+		timer_trace.wraps++;
+}
+
+void trace_timer_irq(u64 tsc, u64 cc, u64 init)
+{
+	timer_irq_te_t *tie = &timer_trace.trace_irq_buf[timer_trace.trace_irq_index];
+
+	tie->tsc_val = tsc;
+	tie->cc_val = cc;
+	tie->init_val = init;
+
+	timer_trace.irqs++;
+	timer_trace.trace_irq_index++;
+	timer_trace.trace_irq_index %= MAX_TRACE_ELEMENTS;
+	if (timer_trace.trace_irq_index == 0)
+		timer_trace.irq_wraps++;
+}
+
+#else
+void init_trace_timer(void) {}
+void trace_timer(u64 next, u64 tsc, u64 cc, u64 esr, u64 lvt) {}
+void trace_timer_irq(u64 tsc, u64 cc, u64 init) {}
+#endif /* ENABLE_TIMER_TRACE */
 
 /* FIXME we should spread the irqs across as many priority levels as possible
  * due to buggy hw */
@@ -395,10 +470,14 @@ static int setup_lapic(int cpu)
 
 	this_cpu(lapic).msr = cpu_read_msr(MSR_IA32_APICBASE);
 
+	init_trace_timer();
+
 	if (!APIC_ENABLED(this_cpu(lapic).msr)) {
 		this_cpu(lapic).msr |= (0x1UL << 11);
 		cpu_write_msr(MSR_IA32_APICBASE, this_cpu(lapic).msr);
 	}
+
+	INIT_SPIN_LOCK(&this_cpu(lapic).lock);
 
 	this_cpu(lapic).pbase = (APIC_BASE(this_cpu(lapic).msr) << 12);
 
@@ -461,6 +540,11 @@ static vmm_irq_return_t
 lapic_clockchip_irq_handler(int irq_no, void *dev)
 {
 	struct lapic_timer *timer = (struct lapic_timer *)dev;
+	u64 cc, init;
+
+	cc = lapic_read(LAPIC_TIMER_CCR(this_cpu(lapic).vbase));
+	init = lapic_read(LAPIC_TIMER_ICR(this_cpu(lapic).vbase));
+	trace_timer_irq(get_tsc_serialized(), cc, init);
 
 #ifndef CONFIG_USE_DEADLINE_TSC
 	/* when using incremental count mode, just set the count
@@ -505,11 +589,15 @@ static int
 lapic_arm_timer(struct lapic_timer *timer)
 {
 	u32 lvt;
+	u32 flags;
+
+	vmm_spin_lock_irqsave(&this_cpu(lapic).lock, flags);
 
 	lvt = lapic_read(LAPIC_LVTTR(this_cpu(lapic).vbase));
 	lvt &= ~APIC_LVT_MASKED;
 	lapic_write(LAPIC_LVTTR(this_cpu(lapic).vbase), lvt);
 	timer->armed = 1;
+	vmm_spin_unlock_irqrestore(&this_cpu(lapic).lock, flags);
 
 	return VMM_OK;
 }
@@ -518,11 +606,15 @@ static __unused int
 lapic_disarm_timer(struct lapic_timer *timer)
 {
 	u32 lvt;
+	u32 flags;
+
+	vmm_spin_lock_irqsave(&this_cpu(lapic).lock, flags);
 
 	lvt = lapic_read(LAPIC_LVTTR(this_cpu(lapic).vbase));
 	lvt |= APIC_LVT_MASKED;
 	lapic_write(LAPIC_LVTTR(this_cpu(lapic).vbase), lvt);
 	timer->armed = 0;
+	vmm_spin_unlock_irqrestore(&this_cpu(lapic).lock, flags);
 
 	return VMM_OK;
 }
@@ -566,43 +658,63 @@ lapic_clockchip_set_next_event(unsigned long next,
 {
 	struct lapic_timer *timer = container_of(cc, struct lapic_timer,
 						 clkchip);
+	u32 flags;
+	int rc;
+
 	BUG_ON(timer == NULL);
+
+	vmm_spin_lock_irqsave(&this_cpu(lapic).lock, flags);
 
 	if (unlikely(!timer->armed)) {
 		lapic_arm_timer(timer);
 		timer->armed = 1;
 	}
 
+	trace_timer(next, get_tsc_serialized(),
+		    lapic_read(LAPIC_TIMER_CCR(this_cpu(lapic).vbase)),
+		    lapic_read(LAPIC_ESR(this_cpu(lapic).vbase)),
+		    lapic_read(LAPIC_LVTTR(this_cpu(lapic).vbase)));
+
 #ifdef CONFIG_USE_DEADLINE_TSC
 	if (this_cpu(lapic).deadline_supported)
 		return lapic_set_deadline(next);
 #endif
 
-	return lapic_set_icr(next);
+	rc = lapic_set_icr(next);
+	vmm_spin_unlock_irqrestore(&this_cpu(lapic).lock, flags);
+
+	return rc;
 }
 
 static void
 lapic_timer_irq_mask(struct vmm_host_irq *irq)
 {
 	struct lapic_timer *timer = (struct lapic_timer *)irq->chip_data;
-	u32 lvt;
+	u32 lvt, flags;
+
+	vmm_spin_lock_irqsave(&this_cpu(lapic).lock, flags);
 
 	/* Disable the local APIC timer */
 	lvt = lapic_read(LAPIC_LVTTR(timer->lapic->vbase));
 	lvt |= APIC_LVT_MASKED;
 	lapic_write(LAPIC_LVTTR(timer->lapic->vbase), lvt);
+	vmm_spin_unlock_irqrestore(&this_cpu(lapic).lock, flags);
 }
 
 static void
 lapic_timer_irq_unmask(struct vmm_host_irq *irq)
 {
 	struct lapic_timer *timer = (struct lapic_timer *)irq->chip_data;
-	u32 lvt;
+	u32 lvt, flags;
+
+	vmm_spin_lock_irqsave(&this_cpu(lapic).lock, flags);
 
 	/* Disable the local APIC timer */
 	lvt = lapic_read(LAPIC_LVTTR(timer->lapic->vbase));
 	lvt &= ~APIC_LVT_MASKED;
 	lapic_write(LAPIC_LVTTR(timer->lapic->vbase), lvt);
+
+	vmm_spin_unlock_irqrestore(&this_cpu(lapic).lock, flags);
 }
 
 int __cpuinit lapic_clockchip_init(void)
@@ -735,6 +847,7 @@ pit_calibrate_tsc(void)
 	return (end - start)/50;
 }
 
+/* NOTE: lapic lock should be held before calling this */
 static void
 lapic_set_timer_count(u32 count, int periodic)
 {
@@ -742,9 +855,6 @@ lapic_set_timer_count(u32 count, int periodic)
 
 	/* Setup Divide Count Register to use the bus frequency directl. */
 	lapic_write(LAPIC_TIMER_DCR(this_cpu(lapic).vbase), LAPIC_TDR_DIV_1);
-
-	/* Program the initial count register */
-	lapic_write(LAPIC_TIMER_ICR(this_cpu(lapic).vbase), count);
 
 	/* Enable the local APIC timer */
 	lvt = lapic_read(LAPIC_LVTTR(this_cpu(lapic).vbase));
@@ -755,6 +865,11 @@ lapic_set_timer_count(u32 count, int periodic)
 		lvt &= ~APIC_LVT_TIMER_PERIODIC;
 
 	lapic_write(LAPIC_LVTTR(this_cpu(lapic).vbase), lvt);
+
+	arch_wmb();
+
+	/* Program the initial count register */
+	lapic_write(LAPIC_TIMER_ICR(this_cpu(lapic).vbase), count);
 }
 
 static void

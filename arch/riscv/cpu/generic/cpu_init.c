@@ -178,12 +178,15 @@ unsigned long riscv_stage2_mode = HGATP_MODE_SV39X4;
 unsigned long riscv_stage2_mode = HGATP_MODE_SV32X4;
 #endif
 unsigned long riscv_stage2_vmid_bits = 0;
+unsigned long riscv_stage2_vmid_nested = 0;
+bool riscv_stage2_use_vmid = false;
 unsigned long riscv_timer_hz = 0;
+bool riscv_aia_available = true;
 
 int __init arch_cpu_nascent_init(void)
 {
 	DECLARE_BITMAP(this_isa, RISCV_ISA_EXT_MAX);
-	struct vmm_devtree_node *dn, *cpus;
+	struct vmm_devtree_node *dn, *in, *cpus;
 	const char *isa, *str;
 	unsigned long val, this_xlen;
 	int rc = VMM_OK;
@@ -245,6 +248,14 @@ int __init arch_cpu_nascent_init(void)
 			break;
 		}
 
+		in = vmm_devtree_find_compatible(dn, NULL,
+						 "riscv,cpu-intc-aia");
+		if (!in) {
+			riscv_aia_available = false;
+		} else {
+			vmm_devtree_dref_node(in);
+		}
+
 		if (riscv_xlen) {
 			if (riscv_xlen != this_xlen ||
 			    riscv_xlen != __riscv_xlen) {
@@ -268,13 +279,14 @@ int __init arch_cpu_nascent_init(void)
 
 	/* Setup Stage2 mode and Stage2 VMID bits */
 	if (riscv_isa_extension_available(NULL, h)) {
-		csr_write(CSR_HGATP, HGATP_VMID_MASK);
-		val = csr_read(CSR_HGATP) & HGATP_VMID_MASK;
+		csr_write(CSR_HGATP, HGATP_VMID);
+		val = csr_read(CSR_HGATP) & HGATP_VMID;
 		riscv_stage2_vmid_bits = fls_long(val >> HGATP_VMID_SHIFT);
+		riscv_stage2_vmid_nested = (1UL << riscv_stage2_vmid_bits) / 2;
 
 #ifdef CONFIG_64BIT
 		/* Try Sv48 MMU mode */
-		csr_write(CSR_HGATP, HGATP_VMID_MASK |
+		csr_write(CSR_HGATP, HGATP_VMID |
 				     (HGATP_MODE_SV48X4 << HGATP_MODE_SHIFT));
 		val = csr_read(CSR_HGATP) >> HGATP_MODE_SHIFT;
 		if (val == HGATP_MODE_SV48X4) {
