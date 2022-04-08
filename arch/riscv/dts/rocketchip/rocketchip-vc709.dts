@@ -1,0 +1,59 @@
+
+/dts-v1/;
+
+#include "rocketchip-vc709.dtsi"
+
+/ {
+	model = "freechips,rocketchip-unknown";
+	compatible = "freechips,rocketchip-unknown-dev";
+
+	reserved-memory {
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			mmode_resv0@80000000 {
+					reg = <0x0 0x80000000 0x0 0x40000>;
+			};
+	};
+
+	chosen {
+		console = &L32;
+		stdout-path = &L32;
+		bootargs = "earlyprintk console=ttyS0,115200";
+		bootcmd = /* Mount initrd device */
+			  "vfs mount initrd /",
+
+			  /* Run boot script */
+			  "vfs run /boot.xscript",
+
+			  /* Print banner */
+			  "vfs cat /system/banner.txt";
+	};
+};
+
+&L32 {
+	status = "okay";
+};
+
+&L33 {
+	status = "okay";
+};
+
+&L34 {
+	status = "okay";
+};
+
+&L38 {
+	status = "okay";
+};
+
+&L52 {
+	compatible = "microchip,enc28j60";
+	reg = <0>; /* CE0 */
+	interrupt-parent = <&L35>;
+	interrupts = <24 0x2>; /* falling edge */
+	sifive,fifo-depth = <1024>;
+	spi-max-frequency = <1000000>;
+	voltage-ranges = <3300 3300>;
+	status = "okay";
+};

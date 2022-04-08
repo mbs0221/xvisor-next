@@ -177,6 +177,33 @@ void __init arch_defterm_early_putc(u8 ch)
 	vmm_writeb(ch, (void *)&reg->tx_rx_fifo);
 }
 
+#elif defined(CONFIG_ARCH_GENERIC_DEFTERM_EARLY_SIFIVE_UART)
+
+#include <drv/serial/sifive-uart.h>
+
+void __init arch_defterm_early_putc(u8 ch)
+{
+	struct sifive_uart *regs = (struct sifive_uart *)early_base;
+
+#if __riscv_atomic
+	int r;
+	do {
+		asm volatile (
+		"amoor.w %0, %2, %1\n"
+		: "=r" (r), "+A" (*(volatile u32 *)(&regs->txdata))
+		: "r" (ch)
+		);
+	} while (r < 0);
+#else
+	/* Wait until FIFO is full */
+	while (vmm_readl_relaxed((void *)&regs->txdata) & SIFIVE_SERIAL_TXDATA_FULL_MASK)
+		arch_cpu_relax();
+
+	/* Send the character */
+	vmm_writeb(ch, (void *)&regs->txdata);
+#endif
+}
+
 #else
 
 void __init arch_defterm_early_putc(u8 ch)
