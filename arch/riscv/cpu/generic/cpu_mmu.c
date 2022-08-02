@@ -111,6 +111,7 @@ bool arch_mmu_valid_block_size(physical_size_t sz)
 {
 	if (
 #ifdef CONFIG_64BIT
+	    (sz == PGTBL_L4_BLOCK_SIZE) ||
 	    (sz == PGTBL_L3_BLOCK_SIZE) ||
 	    (sz == PGTBL_L2_BLOCK_SIZE) ||
 #endif
@@ -132,6 +133,8 @@ int arch_mmu_start_level(int stage)
 			return 2;
 		case SATP_MODE_SV48:
 			return 3;
+		case SATP_MODE_SV57:
+			return 4;
 	#endif
 		default:
 			return 0;
@@ -145,6 +148,8 @@ int arch_mmu_start_level(int stage)
 			return 2;
 		case HGATP_MODE_SV48X4:
 			return 3;
+		case HGATP_MODE_SV57X4:
+			return 4;
 	#endif
 		default:
 			return 0;
@@ -164,6 +169,8 @@ physical_size_t arch_mmu_level_block_size(int stage, int level)
 		return PGTBL_L2_BLOCK_SIZE;
 	case 3:
 		return PGTBL_L3_BLOCK_SIZE;
+	case 4:
+		return PGTBL_L4_BLOCK_SIZE;
 #endif
 	default:
 		break;
@@ -183,6 +190,8 @@ int arch_mmu_level_block_shift(int stage, int level)
 		return PGTBL_L2_BLOCK_SHIFT;
 	case 3:
 		return PGTBL_L3_BLOCK_SHIFT;
+	case 4:
+		return PGTBL_L4_BLOCK_SHIFT;
 #endif
 	default:
 		break;
@@ -202,6 +211,8 @@ physical_addr_t arch_mmu_level_map_mask(int stage, int level)
 		return PGTBL_L2_MAP_MASK;
 	case 3:
 		return PGTBL_L3_MAP_MASK;
+	case 4:
+		return PGTBL_L4_MAP_MASK;
 #endif
 	default:
 		break;
@@ -232,6 +243,10 @@ int arch_mmu_level_index(physical_addr_t ia, int stage, int level)
 		mask = PGTBL_L3_INDEX_MASK;
 		shift = PGTBL_L3_INDEX_SHIFT;
 		break;
+	case 4:
+		mask = PGTBL_L4_INDEX_MASK;
+		shift = PGTBL_L4_INDEX_SHIFT;
+		break;
 #endif
 	default:
 		break;
@@ -256,6 +271,8 @@ int arch_mmu_level_index_shift(int stage, int level)
 		return PGTBL_L2_INDEX_SHIFT;
 	case 3:
 		return PGTBL_L3_INDEX_SHIFT;
+	case 4:
+		return PGTBL_L4_INDEX_SHIFT;
 #endif
 	default:
 		break;

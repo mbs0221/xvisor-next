@@ -248,6 +248,22 @@ void *vmm_host_irq_get_chip_data(struct vmm_host_irq *irq)
 	return (irq) ? irq->chip_data : NULL;
 }
 
+int vmm_host_irq_set_msi_data(u32 hirq, void *msi_data)
+{
+	struct vmm_host_irq *irq = NULL;
+
+	if (NULL == (irq = vmm_host_irq_get(hirq)))
+		return VMM_EFAIL;
+
+	irq->msi_data = msi_data;
+	return VMM_OK;
+}
+
+void *vmm_host_irq_get_msi_data(struct vmm_host_irq *irq)
+{
+	return (irq) ? irq->msi_data : NULL;
+}
+
 int vmm_host_irq_set_handler(u32 hirq, vmm_host_irq_handler_t handler)
 {
 	struct vmm_host_irq *irq = NULL;
@@ -449,6 +465,28 @@ int vmm_host_irq_unmark_ipi(u32 hirq)
 	return VMM_OK;
 }
 
+int vmm_host_irq_mark_chained(u32 hirq)
+{
+	struct vmm_host_irq *irq;
+
+	if (NULL == (irq = vmm_host_irq_get(hirq)))
+		return VMM_ENOTAVAIL;
+
+	irq->state |= VMM_IRQ_STATE_CHAINED;
+	return VMM_OK;
+}
+
+int vmm_host_irq_unmark_chained(u32 hirq)
+{
+	struct vmm_host_irq *irq;
+
+	if (NULL == (irq = vmm_host_irq_get(hirq)))
+		return VMM_ENOTAVAIL;
+
+	irq->state &= ~VMM_IRQ_STATE_CHAINED;
+	return VMM_OK;
+}
+
 bool vmm_host_irq_is_masked(struct vmm_host_irq *irq)
 {
 	u32 percpu_state;
@@ -526,6 +564,21 @@ int vmm_host_irq_raise(u32 hirq,
 		irq->chip->irq_raise(irq, dest);
 	}
 
+	return VMM_OK;
+}
+
+int vmm_host_irq_compose_msi_msg(u32 hirq, struct vmm_msi_msg *msg)
+{
+	struct vmm_host_irq *irq;
+
+	if (!msg)
+		return VMM_EINVALID;
+	if (NULL == (irq = vmm_host_irq_get(hirq)))
+		return VMM_ENOTAVAIL;
+	if (!irq->chip || !irq->chip->irq_compose_msi_msg)
+		return VMM_ENOSYS;
+
+	irq->chip->irq_compose_msi_msg(irq, msg);
 	return VMM_OK;
 }
 
@@ -723,6 +776,7 @@ void __vmm_host_irq_init_desc(struct vmm_host_irq *irq,
 	}
 	irq->chip = NULL;
 	irq->chip_data = NULL;
+	irq->msi_data = NULL;
 	irq->handler = NULL;
 	irq->handler_data = NULL;
 	for (cpu = 0; cpu < CONFIG_CPU_COUNT; cpu++) {

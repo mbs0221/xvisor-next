@@ -24,6 +24,7 @@
 #include <vmm_error.h>
 #include <vmm_stdio.h>
 #include <vmm_heap.h>
+#include <vmm_timer.h>
 #include <vmm_guest_aspace.h>
 #include <vmm_host_aspace.h>
 #include <generic_mmu.h>
@@ -76,8 +77,8 @@ static const struct nested_swtlb_entry *nested_swtlb_lookup(
 	struct nested_swtlb_entry *swte;
 
 	list_for_each_entry(swte, &swtlb->itlb.active_list, head) {
-		if (swte->page.ia <= guest_gpa &&
-		    guest_gpa < (swte->page.ia + swte->page.sz)) {
+		if (swte->shadow_page.ia <= guest_gpa &&
+		    guest_gpa < (swte->shadow_page.ia + swte->shadow_page.sz)) {
 			list_del(&swte->head);
 			list_add(&swte->head, &swtlb->itlb.active_list);
 			return swte;
@@ -85,8 +86,8 @@ static const struct nested_swtlb_entry *nested_swtlb_lookup(
 	}
 
 	list_for_each_entry(swte, &swtlb->dtlb.active_list, head) {
-		if (swte->page.ia <= guest_gpa &&
-		    guest_gpa < (swte->page.ia + swte->page.sz)) {
+		if (swte->shadow_page.ia <= guest_gpa &&
+		    guest_gpa < (swte->shadow_page.ia + swte->shadow_page.sz)) {
 			list_del(&swte->head);
 			list_add(&swte->head, &swtlb->dtlb.active_list);
 			return swte;
@@ -117,8 +118,9 @@ static void nested_swtlb_update(struct vmm_vcpu *vcpu, bool itlb,
 				  struct nested_swtlb_entry, head);
 		rc = mmu_unmap_page(npriv->pgtbl, &swte->shadow_page);
 		if (rc) {
-			vmm_panic("%s: shadow page unmap failed (error %d)\n",
-				  __func__, rc);
+			vmm_panic("%s: shadow page unmap @ 0x%"PRIPADDR
+				  " failed (error %d)\n", __func__,
+				  swte->shadow_page.ia, rc);
 		}
 	} else {
 		BUG_ON(1);
@@ -130,8 +132,9 @@ static void nested_swtlb_update(struct vmm_vcpu *vcpu, bool itlb,
 
 	rc = mmu_map_page(npriv->pgtbl, &swte->shadow_page);
 	if (rc) {
-		vmm_panic("%s: shadow page map failed (error %d)\n",
-			  __func__, rc);
+		vmm_panic("%s: shadow page map @ 0x%"PRIPADDR
+			  " failed (error %d)\n", __func__,
+			  swte->shadow_page.ia, rc);
 	}
 
 	list_add(&swte->head, &xtlb->active_list);
@@ -165,8 +168,9 @@ void cpu_vcpu_nested_swtlb_flush(struct vmm_vcpu *vcpu,
 
 		rc = mmu_unmap_page(npriv->pgtbl, &swte->shadow_page);
 		if (rc) {
-			vmm_panic("%s: shadow page unmap failed (error %d)\n",
-				  __func__, rc);
+			vmm_panic("%s: shadow page unmap @ 0x%"PRIPADDR
+				  " failed (error %d)\n", __func__,
+				  swte->shadow_page.ia, rc);
 		}
 
 		list_add_tail(&swte->head, &swtlb->itlb.free_list);
@@ -182,8 +186,9 @@ void cpu_vcpu_nested_swtlb_flush(struct vmm_vcpu *vcpu,
 
 		rc = mmu_unmap_page(npriv->pgtbl, &swte->shadow_page);
 		if (rc) {
-			vmm_panic("%s: shadow page unmap failed (error %d)\n",
-				  __func__, rc);
+			vmm_panic("%s: shadow page unmap @ 0x%"PRIPADDR
+				  " failed (error %d)\n", __func__,
+				  swte->shadow_page.ia, rc);
 		}
 
 		list_add_tail(&swte->head, &swtlb->dtlb.free_list);
@@ -488,6 +493,9 @@ static int nested_xlate_gstage(struct nested_xlate_context *xc,
 	} else {
 		switch (mode) {
 #ifdef CONFIG_64BIT
+		case HGATP_MODE_SV57X4:
+			rc = 4;
+			break;
 		case HGATP_MODE_SV48X4:
 			rc = 3;
 			break;
@@ -588,15 +596,12 @@ static int nested_xlate_gstage(struct nested_xlate_context *xc,
 			xc->host_pa |= guest_hpa & (xc->host_sz - 1);
 			xc->host_sz = page.sz;
 			xc->host_pa &= ~(xc->host_sz - 1);
-		} else {
-			page.ia = guest_gpa & ~(xc->host_sz - 1);
-			page.oa = guest_hpa & ~(xc->host_sz - 1);
-			page.sz = xc->host_sz;
 		}
 
 		/* Prepare shadow page */
 		memset(&shadow_page, 0, sizeof(shadow_page));
-		shadow_page.ia = page.ia;
+		shadow_page.ia = (page.sz <= xc->host_sz) ?
+				 page.ia : guest_gpa & ~(xc->host_sz - 1);
 		shadow_page.oa = xc->host_pa;
 		shadow_page.sz = xc->host_sz;
 		shadow_page.flags.dirty = 1;
@@ -713,6 +718,9 @@ static int nested_xlate_vsstage(struct nested_xlate_context *xc,
 	} else {
 		switch (mode) {
 #ifdef CONFIG_64BIT
+		case SATP_MODE_SV57:
+			rc = 4;
+			break;
 		case SATP_MODE_SV48:
 			rc = 3;
 			break;
@@ -787,11 +795,24 @@ static int nested_xlate_vsstage(struct nested_xlate_context *xc,
 	return VMM_OK;
 }
 
+static void nested_timer_event_expired(struct vmm_timer_event *ev)
+{
+	/* Do nothing */
+}
+
 int cpu_vcpu_nested_init(struct vmm_vcpu *vcpu)
 {
 	int rc;
+	struct vmm_timer_event *event;
 	u32 pgtbl_attr = 0, pgtbl_hw_tag = 0;
 	struct riscv_priv_nested *npriv = riscv_nested_priv(vcpu);
+
+	event = vmm_zalloc(sizeof(struct vmm_timer_event));
+	if (!event) {
+		return VMM_ENOMEM;
+	}
+	INIT_TIMER_EVENT(event, nested_timer_event_expired, vcpu);
+	npriv->timer_event = event;
 
 	if (riscv_stage2_vmid_available()) {
 		pgtbl_hw_tag = riscv_stage2_vmid_nested + vcpu->guest->id;
@@ -800,12 +821,14 @@ int cpu_vcpu_nested_init(struct vmm_vcpu *vcpu)
 	npriv->pgtbl = mmu_pgtbl_alloc(MMU_STAGE2, -1, pgtbl_attr,
 				       pgtbl_hw_tag);
 	if (!npriv->pgtbl) {
+		vmm_free(npriv->timer_event);
 		return VMM_ENOMEM;
 	}
 
 	rc = nested_swtlb_init(vcpu);
 	if (rc) {
 		mmu_pgtbl_free(npriv->pgtbl);
+		vmm_free(npriv->timer_event);
 		return rc;
 	}
 
@@ -816,6 +839,7 @@ void cpu_vcpu_nested_reset(struct vmm_vcpu *vcpu)
 {
 	struct riscv_priv_nested *npriv = riscv_nested_priv(vcpu);
 
+	vmm_timer_event_stop(npriv->timer_event);
 	cpu_vcpu_nested_swtlb_flush(vcpu, 0, 0);
 	npriv->virt = FALSE;
 #ifdef CONFIG_64BIT
@@ -850,6 +874,7 @@ void cpu_vcpu_nested_deinit(struct vmm_vcpu *vcpu)
 
 	nested_swtlb_deinit(vcpu);
 	mmu_pgtbl_free(npriv->pgtbl);
+	vmm_free(npriv->timer_event);
 }
 
 void cpu_vcpu_nested_dump_regs(struct vmm_chardev *cdev,
@@ -1089,7 +1114,8 @@ int cpu_vcpu_nested_hext_csr_rmw(struct vmm_vcpu *vcpu, arch_regs_t *regs,
 			 */
 #ifdef CONFIG_64BIT
 			case HGATP_MODE_SV39X4:
-				if (riscv_stage2_mode != HGATP_MODE_SV48X4 &&
+				if (riscv_stage2_mode != HGATP_MODE_SV57X4 &&
+				    riscv_stage2_mode != HGATP_MODE_SV48X4 &&
 				    riscv_stage2_mode != HGATP_MODE_SV39X4) {
 					mode = HGATP_MODE_OFF;
 				}
@@ -1159,13 +1185,20 @@ int cpu_vcpu_nested_hext_csr_rmw(struct vmm_vcpu *vcpu, arch_regs_t *regs,
 			mode = (new_val & SATP_MODE) >> SATP_MODE_SHIFT;
 			switch (mode) {
 #ifdef CONFIG_64BIT
+			case SATP_MODE_SV57:
+				if (riscv_stage1_mode != SATP_MODE_SV57) {
+					mode = SATP_MODE_OFF;
+				}
+				break;
 			case SATP_MODE_SV48:
-				if (riscv_stage1_mode != SATP_MODE_SV48) {
+				if (riscv_stage1_mode != SATP_MODE_SV57 &&
+				    riscv_stage1_mode != SATP_MODE_SV48) {
 					mode = SATP_MODE_OFF;
 				}
 				break;
 			case SATP_MODE_SV39:
-				if (riscv_stage1_mode != SATP_MODE_SV48 &&
+				if (riscv_stage1_mode != SATP_MODE_SV57 &&
+				    riscv_stage1_mode != SATP_MODE_SV48 &&
 				    riscv_stage1_mode != SATP_MODE_SV39) {
 					mode = SATP_MODE_OFF;
 				}
@@ -1526,4 +1559,69 @@ skip_csr_update:
 
 	/* Update virt flag */
 	npriv->virt = virt;
+}
+
+void cpu_vcpu_nested_take_vsirq(struct vmm_vcpu *vcpu,
+				struct arch_regs *regs)
+{
+	int vsirq;
+	bool next_spp;
+	unsigned long irqs;
+	struct cpu_vcpu_trap trap;
+	struct riscv_priv_nested *npriv;
+
+	/* Do nothing for Orphan VCPUs */
+	if (!vcpu->is_normal) {
+		return;
+	}
+
+	/* Do nothing if virt state is OFF */
+	npriv = riscv_nested_priv(vcpu);
+	if (!npriv->virt) {
+		return;
+	}
+
+	/* Determine virtual-VS mode interrupt number */
+	vsirq = 0;
+	irqs = npriv->hvip;
+	irqs &= npriv->vsie << 1;
+	irqs &= npriv->hideleg;
+	if (irqs & MIP_VSEIP) {
+		vsirq = IRQ_S_EXT;
+	} else if (irqs & MIP_VSTIP) {
+		vsirq = IRQ_S_TIMER;
+	} else if (irqs & MIP_VSSIP) {
+		vsirq = IRQ_S_SOFT;
+	}
+	if (vsirq <= 0) {
+		return;
+	}
+
+	/*
+	 * Determine whether we are resuming in virtual-VS mode
+	 * or virtual-VU mode
+	 */
+	next_spp = (regs->sstatus & SSTATUS_SPP) ? TRUE : FALSE;
+
+	/*
+	 * If we going to virtual-VS mode and interrupts are disabled
+	 * then start nested timer event.
+	 */
+	if (next_spp && !(csr_read(CSR_VSSTATUS) & SSTATUS_SIE)) {
+		if (!vmm_timer_event_pending(npriv->timer_event)) {
+			vmm_timer_event_start(npriv->timer_event, 10000000);
+		}
+		return;
+	}
+	vmm_timer_event_stop(npriv->timer_event);
+
+	/* Take virtual-VS mode interrupt */
+	trap.scause = SCAUSE_INTERRUPT_MASK | vsirq;
+	trap.sepc = regs->sepc;
+	trap.stval = 0;
+	trap.htval = 0;
+	trap.htinst = 0;
+	cpu_vcpu_redirect_smode_trap(regs, &trap, next_spp);
+
+	return;
 }
